@@ -1,10 +1,12 @@
 import os
 import asyncio
 from dotenv import load_dotenv
-from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel, set_tracing_disabled, function_tool, input_guardrail, RunContextWrapper, ModelSettings
+from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel, set_tracing_disabled, function_tool, input_guardrail, RunContextWrapper, ModelSettings, enable_verbose_stdout_logging
 from agents.run import RunConfig
 from pydantic import BaseModel, Field
 from typing import Dict, Optional
+
+# enable_verbose_stdout_logging()
 
 # --- USER CONTEXT ---
 class UserContext(BaseModel):
@@ -58,7 +60,7 @@ LIBRARY_TIMINGS: Dict[str, str] = {
 VALID_MEMBERS = {"M-1001", "M-2002", "M-3003"}
 
 # --- GUARDRAIL AGENT ---
-class GuardrailAgent(Agent):
+class GuardrailAgent(Agent):    
     def __init__(self):
         super().__init__(
             name="guardrail-agent",
@@ -71,19 +73,22 @@ class GuardrailAgent(Agent):
             model=model_gemini,
         )
 
+    def copy(self):
+        return super().copy()
+
 
 guardrail_agent = GuardrailAgent()
 
 # --- INPUT GUARDRAIL ---
 @input_guardrail
-def library_input_guardrail(ctx: RunContextWrapper, user_message: str) -> None:
-    result = Runner.run_sync(guardrail_agent, user_message)
-    if result.content.strip().upper() != "ALLOW":
+async def library_input_guardrail(ctx: RunContextWrapper, user_message: str, tool_call = None) -> None:
+    result = await Runner.run(guardrail_agent, user_message)
+    if result.final_output.strip().upper() != "ALLOW":
         raise ValueError("❌ This assistant only answers library-related questions.")
 
 # --- MEMBER CHECK ---
 def is_member_allowed(ctx: RunContextWrapper) -> bool:
-    uc: UserContext = ctx.unwrap()
+    uc: UserContext = ctx.context
     return bool(uc and uc.member_id and uc.member_id in VALID_MEMBERS)
 
 # --- FUNCTION TOOLS ---
@@ -94,7 +99,7 @@ def search_book(ctx: RunContextWrapper, book_name: str) -> dict:
         "in_catalog": book_name in BOOK_DB
     }
 
-@function_tool(is_enabled=lambda ctx: is_member_allowed(ctx))
+@function_tool(is_enabled=lambda ctx, _: is_member_allowed(ctx))
 def check_availability(ctx: RunContextWrapper, book_name: str) -> dict:
     if book_name not in BOOK_DB:
         return {"title": book_name, "available_copies": 0, "note": "Not in catalog."}
@@ -120,15 +125,26 @@ library_agent = Agent(
     ),
     input_guardrails=[library_input_guardrail],
     tools=[search_book, check_availability, get_library_timings],
-    dynamic_instructions=lambda ctx: f"Personalize answers for {ctx['user'].name} "
-                                     f"(Member ID: {ctx['user'].member_id})."
 )
 
 # --- HANDLE QUERY ---
-async def handle_query(prompt: str, user: UserContext):
-    ctx = {"user": user}
-    result = await Runner.run(library_agent, prompt, ctx)
-    return result.output_text
+async def handle_query(prompt: str, ctx: UserContext):
+    personalized_prompt = (
+        f"Hello {ctx.name}! (Member ID: {ctx.member_id}). "
+        f"Please answer politely and help with library services. "
+        f"User asked: {prompt}"
+    )
+
+    result = await Runner.run(
+        library_agent,
+        personalized_prompt,
+        run_config=config,
+        context=ctx
+    )
+
+    return result
+
+
 
 
 # --- MAIN LOOP ---
